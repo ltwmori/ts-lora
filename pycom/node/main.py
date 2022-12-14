@@ -78,6 +78,7 @@ def airtime_calc(sf,cr,pl,bw):
     Tpayload = payloadSymbNB * Tsym
     return Tpream + Tpayload
 
+
 def join_request(_sf):
     global lora
     global DevEUI
@@ -90,8 +91,12 @@ def join_request(_sf):
     global DevNonce
     global AppSKey
     # SF is added because 1-channel/SF gws are used
-    rmsg = DevEUI+":"+JoinEUI+":"+str(DevNonce)+":"+str(_sf)
-    pkg = struct.pack(_LORA_PKG_FORMAT % len(rmsg), MY_ID, len(rmsg), rmsg)
+    # rmsg = DevEUI+":"+JoinEUI+":"+str(DevNonce)+":"+str(_sf)
+    # pkg = struct.pack(_LORA_PKG_FORMAT % len(rmsg), MY_ID, len(rmsg), rmsg)
+
+    rmsg = hex(DevEUI)+hex(JoinEUI)+str(DevNonce)+str(_sf)
+    pkg = struct.pack("BBBQQIB", MY_ID, len(rmsg), 0x01, DevEUI, JoinEUI, DevNonce, _sf)
+
     i = 0
     while (i == 0):
         pycom.rgbled(blue)
@@ -110,15 +115,16 @@ def join_request(_sf):
         try:
             lora_sock.settimeout(10)
             while (True):
-                recv_pkg = lora_sock.recv(50)
+                # recv_pkg = lora_sock.recv(50)
                 if (len(recv_pkg) > 2):
                     recv_pkg_len = recv_pkg[1]
                     recv_pkg_id = recv_pkg[0]
                     if (int(recv_pkg_id) == 1):
-                        dev_id, leng, rmsg = struct.unpack(_LORA_RCV_PKG_FORMAT % recv_pkg_len, recv_pkg)
-                        print('Received response from', dev_id, rmsg)
-                        rmsg = rmsg.decode('utf-8')
-                        (dev_id, DevAddr, JoinNonce) = rmsg.split(":")
+                        # dev_id, leng, rmsg = struct.unpack(_LORA_RCV_PKG_FORMAT % recv_pkg_len, recv_pkg)
+                        (id, leng, dev_id, DevAddr, JoinNonce) = struct.unpack("BBBII", recv_pkg)
+                        print('Received response from', id, dev_id, hex(DevAddr), JoinNonce)
+                        # rmsg = rmsg.decode('utf-8')
+                        # (dev_id, DevAddr, JoinNonce) = rmsg.split(":")
                         if (int(dev_id) == int(MY_ID)):
                             pycom.rgbled(blue)
                             lora.power_mode(LoRa.SLEEP)
@@ -126,31 +132,35 @@ def join_request(_sf):
                             start = -10000
                             i = 1
                             break
+                recv_pkg = lora_sock.recv(50)
         except:
             print("No answer received!")
             if (i == 0):
                 lora.power_mode(LoRa.SLEEP)
                 active_rx += chrono.read_ms()-start
                 random_sleep(5)
-                DevNonce += 1
+                DevNonce += 0x00000001
 
     # AppSKey generation
-    text = "".join( [AppKey[:2], JoinNonce, JoinEUI, str(DevNonce)] )
+    # text = "".join( [AppKey[:2], JoinNonce, JoinEUI, str(DevNonce)] )
+    text = struct.pack("BIiI", 0x02, JoinNonce, 0xFFFFFF, DevNonce)
     while (len(text) < 32):
         text = "".join([text,"0"])
     encryptor = AES(AppKey, AES.MODE_ECB)
     try:
-        AppSKey = encryptor.encrypt(binascii.unhexlify(text))
+        # AppSKey = encryptor.encrypt(binascii.unhexlify(text))
+        AppSKey = encryptor.encrypt(text)
     except:
         print("wrong text size!")
     print("Length of the text and AppSKey:", len(text), len(AppSKey))
     # slot generation
-    text = "".join([DevAddr, DevEUI])
+    # text = "".join([DevAddr, DevEUI])
+    text = "".join([hex(DevAddr)[2:], hex(DevEUI)[2:]])
     thash = uhashlib.sha256()
     thash.update(text)
     thash = int(ubinascii.hexlify(thash.digest()), 16)
     my_slot = thash % S
-    print("Slot =", my_slot, "DevAddr =", DevAddr)
+    print("Slot =", my_slot, "DevAddr =", hex(DevAddr))
     print("joining the network lasted (ms):", chrono.read_ms()-join_start)
     sync()
 
@@ -178,10 +188,11 @@ def sync():
             recv_pkg_id = recv_pkg[0]
             if (int(recv_pkg_id) == (my_sf-5)):
                 sack_rcv = chrono.read_us()
-                dev_id, leng, s_msg = struct.unpack(_LORA_RCV_PKG_FORMAT % recv_pkg_len, recv_pkg)
-                s_msg = s_msg.decode('utf-8')
+                # dev_id, leng, s_msg = struct.unpack(_LORA_RCV_PKG_FORMAT % recv_pkg_len, recv_pkg)
+                (id, leng, index, proc_gw, acks) = struct.unpack("BBBB%ds" % recv_pkg_len, recv_pkg)
+                # s_msg = s_msg.decode('utf-8')
                 sack_bytes = recv_pkg_len
-                (index, proc_gw, acks) = s_msg.split(":")
+                # (index, proc_gw, acks) = s_msg.split(":")
                 (index, proc_gw) = (int(index), int(proc_gw)*1000)
                 print("ACK!")
                 lora.power_mode(LoRa.SLEEP)
@@ -215,7 +226,8 @@ def start_transmissions(_pkts):
     global msg
     global sack_bytes
     airt = int(airtime_calc(my_sf,1,packet_size+2,my_bw_plain)*1000)
-    duty_cycle_limit_slots = math.ceil(100*airt/(airt + 2*guard))
+    slot = airt + 2*guard
+    duty_cycle_limit_slots = math.ceil(100*airt/slot)
     proc_and_switch = 12000 # time for preparing the packet and switch radio mode (us)
     # if (int(MY_ID) == 22 or int(MY_ID) == 34): # fipy nodes switch faster
         # proc_and_switch = 10000
@@ -228,7 +240,9 @@ def start_transmissions(_pkts):
     fpas = 1
     repeats = 0
     clock_correct = 0
-    sync_slot = int(airtime_calc(my_sf,1,sack_bytes+2,my_bw_plain)*1000+guard+proc_gw)
+    # sync_slot = int(airtime_calc(my_sf,1,sack_bytes+2,my_bw_plain)*1000+guard+proc_gw)
+    sync_slot = int(airtime_calc(my_sf,1,sack_bytes,my_bw_plain)*1000+2*guard)
+
     clocks = [sync_slot]
     print("-----")
     print("MY SLOT:", my_slot)
@@ -237,10 +251,11 @@ def start_transmissions(_pkts):
     print("Guard time (ms):", guard/1000)
     print("Duty cycle slots:", duty_cycle_limit_slots)
     print("SACK slot length (ms):", sync_slot/1000)
-    print("Gw processing time (ms):", int(proc_gw/1000))
+    print("Gw processing time (ms):", int(proc_gw))
     print("Time after SACK rec (ms):", (chrono.read_us()-sack_rcv)/1000)
 
-    i = 1
+    # i = 1
+    i = 0x0001
     (succeeded, retrans, dropped, active_rx, active_tx) = (0, 0, 0, 0.0, 0.0)
     print("S T A R T")
     while(i <= _pkts): # stop after pkts # of packets
@@ -250,20 +265,27 @@ def start_transmissions(_pkts):
         pycom.rgbled(green)
         print("starting a new round at (ms):", start/1000)
         # calculate the time until the sack packet
+        # if (int(index) > duty_cycle_limit_slots):
+        #     round_length = math.ceil(int(index)*(airt + 2*guard))
+        # else:
+        #     round_length = math.ceil(duty_cycle_limit_slots*(airt + 2*guard))
+
         if (int(index) > duty_cycle_limit_slots):
-            round_length = math.ceil(int(index)*(airt + 2*guard))
+            round_length = math.ceil(index*slot + sync_slot + 100000)
         else:
-            round_length = math.ceil(duty_cycle_limit_slots*(airt + 2*guard))
+            round_length = math.ceil(duty_cycle_limit_slots*slot + sync_slot + 100000)
+
         round_length += proc_gw # gw proc time (us)
         t = int(my_slot*(airt + 2*guard) + guard - proc_and_switch) # sleep time before transmission
         print("sleep time (ms):", t/1000)
         pycom.rgbled(off)
         time.sleep_us(t)
         _thread.start_new_thread(generate_msg, ())
-        cipher = AES(AppSKey, AES.MODE_ECB)
+        # cipher = AES(AppSKey, AES.MODE_ECB)
         # print("Before encryption:", msg)
-        msg = cipher.encrypt(msg)
+        # msg = cipher.encrypt(msg)
         # print("After encryption:", msg)
+        msg = AES(AppSKey, 1).decrypt(msg)
         pycom.rgbled(red)
         on_time = chrono.read_us()
         lora.init(mode=LoRa.LORA, tx_iq=True, region=LoRa.EU868, frequency=freqs[my_sf-5], power_mode=LoRa.TX_ONLY, bandwidth=my_bw, sf=my_sf, tx_power=14)
@@ -372,8 +394,10 @@ def start_transmissions(_pkts):
 
     # send out stats
     print("I'm sending stats")
-    stat_msg = str(i-1)+":"+str(succeeded)+":"+str(retrans)+":"+str(dropped)+":"+str(active_rx/1e6)+":"+str(active_tx/1e6)
-    pkg = struct.pack(_LORA_PKG_FORMAT % len(stat_msg), MY_ID, len(stat_msg), stat_msg)
+    # stat_msg = str(i-1)+":"+str(succeeded)+":"+str(retrans)+":"+str(dropped)+":"+str(active_rx/1e6)+":"+str(active_tx/1e6)
+    # pkg = struct.pack(_LORA_PKG_FORMAT % len(stat_msg), MY_ID, len(stat_msg), stat_msg)
+    pkg = struct.pack("BBBHHHHff", MY_ID, leng, 0x02, int(i-1), int(succeeded), int(retrans), int(dropped), active_rx/1e6, active_tx/1e6)
+
     for x in range(3): # send it out 3 times
         lora.init(mode=LoRa.LORA, tx_iq=True, region=LoRa.EU868, frequency=freqs[0], power_mode=LoRa.TX_ONLY, bandwidth=LoRa.BW_125KHZ, sf=12, tx_power=7)
         pycom.rgbled(blue)
@@ -457,8 +481,8 @@ chrono = Timer.Chrono()
 # chrono.start()
 # start_transmissions(100)
 
-lora.init(mode=LoRa.LORA, rx_iq=True, region=LoRa.EU868, frequency=freqs[0], power_mode=LoRa.ALWAYS_ON, bandwidth=LoRa.BW_125KHZ, sf=12)
-print("Waiting for commands...")
+# lora.init(mode=LoRa.LORA, rx_iq=True, region=LoRa.EU868, frequency=freqs[0], power_mode=LoRa.ALWAYS_ON, bandwidth=LoRa.BW_125KHZ, sf=12)
+# print("Waiting for commands...")
 pycom.rgbled(green)
 while(True):
     recv_pkg = lora_sock.recv(30)
